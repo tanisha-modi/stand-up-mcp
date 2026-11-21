@@ -6,8 +6,10 @@ import re
 
 import httpx
 from dotenv import load_dotenv
+from datetime import datetime, timedelta, timezone
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 mcp = MCPServer("standup-mcp")
 
@@ -50,6 +52,14 @@ def _github_get(path: str, params: dict | None = None) -> list | dict:
         raise ToolError(f"GitHub API error: HTTP {response.status_code}")
     return response.json()
 
+def _check_repo(repo: str) -> None:
+    if not REPO_PATTERN.match(repo):
+        raise ToolError('repo must look like "owner/name"')
+
+
+def _parse_time(value: str) -> datetime:
+    # GitHub returns times like "2026-11-20T00:22:23Z"
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 @mcp.tool()
 def list_pull_requests(
@@ -66,7 +76,7 @@ def list_pull_requests(
         author: Only include PRs opened by this GitHub username.
         max_results: Maximum number of PRs to return (1-50).
     """
-    if not REPO_PATTERN.match(repo):
+    if _check_repo(repo):
         raise ToolError('repo must look like "owner/name"')
     if state not in ("open", "closed", "all"):
         raise ToolError('state must be "open", "closed", or "all"')
@@ -97,6 +107,84 @@ def list_pull_requests(
         if len(results) >= max_results:
             break
     return results
+
+
+@mcp.tool()
+def list_open_issues(
+    repo: str,
+    assignee: str | None = None,
+    max_results: int = 20,
+) -> list[dict]:
+    """List open issues (not pull requests) for a GitHub repository.
+
+    Args:
+        repo: Repository in "owner/name" form, e.g. "tanisha-modi/stand-up-mcp".
+        assignee: Only include issues assigned to this GitHub username.
+        max_results: Maximum number of issues to return (1-50).
+    """
+    _check_repo(repo)
+    if not 1 <= max_results <= 50:
+        raise ToolError("max_results must be between 1 and 50")
+
+    params = {"state": "open", "per_page": 50, "sort": "updated", "direction": "desc"}
+    if assignee:
+        params["assignee"] = assignee
+
+    items = _github_get(f"/repos/{repo}/issues", params=params)
+
+    results = []
+    for item in items:
+        # GitHub's issues endpoint also returns pull requests; skip those
+        if "pull_request" in item:
+            continue
+        results.append(
+            {
+                "number": item["number"],
+                "title": item["title"],
+                "author": item["user"]["login"],
+                "labels": [label["name"] for label in item["labels"]],
+                "created_at": item["created_at"],
+                "updated_at": item["updated_at"],
+                "url": item["html_url"],
+            }
+        )
+        if len(results) >= max_results:
+            break
+    return results
+
+
+@mcp.tool()
+def find_stale_prs(repo: str, stale_days: int = 7) -> list[dict]:
+    """Find open pull requests that have had no activity for a while.
+
+    Args:
+        repo: Repository in "owner/name" form, e.g. "tanisha-modi/stand-up-mcp".
+        stale_days: A PR is stale if untouched for at least this many days (0-365).
+    """
+    _check_repo(repo)
+    if not 0 <= stale_days <= 365:
+        raise ToolError("stale_days must be between 0 and 365")
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=stale_days)
+    pulls = _github_get(
+        f"/repos/{repo}/pulls",
+        params={"state": "open", "per_page": 50, "sort": "updated", "direction": "asc"},
+    )
+
+    stale = []
+    for pr in pulls:
+        updated = _parse_time(pr["updated_at"])
+        if updated <= cutoff:
+            stale.append(
+                {
+                    "number": pr["number"],
+                    "title": pr["title"],
+                    "author": pr["user"]["login"],
+                    "days_idle": (datetime.now(timezone.utc) - updated).days,
+                    "url": pr["html_url"],
+                }
+            )
+    return stale
 
 @mcp.tool()
 def get_recent_commits(
