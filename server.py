@@ -11,6 +11,13 @@ from datetime import datetime, timedelta, timezone
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
+import json
+import logging
+import sqlite3
+import sys
+import time
+from contextlib import closing
+
 mcp = MCPServer("standup-mcp")
 
 # Unit separator: a character that never appears in commit messages
@@ -24,8 +31,56 @@ GITHUB_API = "https://api.github.com"
 REPO_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
+logging.basicConfig(stream=sys.stderr, level=logging.INFO)
+log = logging.getLogger("standup-mcp")
+
+DB_PATH = Path(__file__).parent / "cache.db"
+CACHE_TTL_SECONDS = 300  # 5 minutes
+
+
+def _db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS cache ("
+        "key TEXT PRIMARY KEY, value TEXT NOT NULL, fetched_at REAL NOT NULL)"
+    )
+    return conn
+
+
+def _cache_get(key: str):
+    """Return the cached value if it is still fresh, otherwise None."""
+    try:
+        with closing(_db()) as conn:
+            row = conn.execute(
+                "SELECT value, fetched_at FROM cache WHERE key = ?", (key,)
+            ).fetchone()
+    except sqlite3.Error as e:
+        log.warning("cache read failed: %s", e)
+        return None
+    if row and time.time() - row[1] < CACHE_TTL_SECONDS:
+        return json.loads(row[0])
+    return None
+
+
+def _cache_put(key: str, value) -> None:
+    try:
+        with closing(_db()) as conn, conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO cache (key, value, fetched_at) VALUES (?, ?, ?)",
+                (key, json.dumps(value), time.time()),
+            )
+    except sqlite3.Error as e:
+        log.warning("cache write failed: %s", e)
+
+
 def _github_get(path: str, params: dict | None = None) -> list | dict:
-    """Call the GitHub API and turn failures into readable tool errors."""
+    """Call the GitHub API (with a short-lived cache) and raise readable errors."""
+    key = path + "?" + json.dumps(params or {}, sort_keys=True)
+    cached = _cache_get(key)
+    if cached is not None:
+        log.info("cache hit: %s", path)
+        return cached
+
     token = os.environ.get("GITHUB_TOKEN")
     if not token:
         raise ToolError("GITHUB_TOKEN is not set. Add it to the .env file.")
@@ -50,7 +105,10 @@ def _github_get(path: str, params: dict | None = None) -> list | dict:
         raise ToolError("GitHub refused the request (rate limit or missing permission).")
     if response.status_code >= 400:
         raise ToolError(f"GitHub API error: HTTP {response.status_code}")
-    return response.json()
+    data = response.json()
+    _cache_put(key, data)
+    log.info("cache miss, fetched: %s", path)
+    return data
 
 def _check_repo(repo: str) -> None:
     if not REPO_PATTERN.match(repo):
@@ -60,6 +118,16 @@ def _check_repo(repo: str) -> None:
 def _parse_time(value: str) -> datetime:
     # GitHub returns times like "2026-11-20T00:22:23Z"
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+@mcp.tool()
+def clear_cache() -> str:
+    """Delete all cached GitHub responses so the next request fetches fresh data."""
+    try:
+        with closing(_db()) as conn, conn:
+            conn.execute("DELETE FROM cache")
+    except sqlite3.Error as e:
+        raise ToolError(f"Could not clear the cache: {e}")
+    return "Cache cleared."
 
 @mcp.tool()
 def list_pull_requests(
@@ -76,8 +144,7 @@ def list_pull_requests(
         author: Only include PRs opened by this GitHub username.
         max_results: Maximum number of PRs to return (1-50).
     """
-    if _check_repo(repo):
-        raise ToolError('repo must look like "owner/name"')
+    _check_repo(repo)
     if state not in ("open", "closed", "all"):
         raise ToolError('state must be "open", "closed", or "all"')
     if not 1 <= max_results <= 50:
@@ -186,6 +253,7 @@ def find_stale_prs(repo: str, stale_days: int = 7) -> list[dict]:
             )
     return stale
 
+ 
 @mcp.tool()
 def get_recent_commits(
     repo_path: str,
@@ -196,22 +264,22 @@ def get_recent_commits(
     """Get recent commits from a local git repository.
 
     Args:
-        repo_path: Absolute path to the git repository.
+        repo_path: Absolute path to a local git repository folder, e.g. "C:\\Users\\tanis\\Downloads\\Code2". Not a GitHub URL.
         days: How many days back to look (1-90).
-        author: Only include commits whose author matches this name or email.
+        author: Only include commits whose author name or email contains this text. Optional.
         max_commits: Maximum number of commits to return (1-200).
     """
     # 1. Validate inputs before touching the file system or running anything
     if not 1 <= days <= 90:
-        raise ValueError("days must be between 1 and 90")
+        raise ToolError("days must be between 1 and 90")
     if not 1 <= max_commits <= 200:
-        raise ValueError("max_commits must be between 1 and 200")
+        raise ToolError("max_commits must be between 1 and 200")
 
     path = Path(repo_path).expanduser().resolve()
     if not path.is_dir():
-        raise ValueError(f"Not a directory: {path}")
+        raise ToolError(f"Not a directory: {path}")
     if not (path / ".git").exists():
-        raise ValueError(f"Not a git repository: {path}")
+        raise ToolError(f"Not a git repository: {path}")
 
     # 2. Build the git command as a list (never a string) to avoid shell injection
     cmd = [
@@ -226,14 +294,20 @@ def get_recent_commits(
     # 3. Run it, with a timeout so a hung process can't freeze the server
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=15, check=True
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            check=True,
         )
     except FileNotFoundError:
-        raise ValueError("git is not installed or not on PATH")
+        raise ToolError("git is not installed or not on PATH")
     except subprocess.TimeoutExpired:
-        raise ValueError("git log timed out")
+        raise ToolError("git log timed out")
     except subprocess.CalledProcessError as e:
-        raise ValueError(f"git log failed: {e.stderr.strip()}")
+        raise ToolError(f"git log failed: {e.stderr.strip()}")
 
     # 4. Parse each line into a dictionary
     commits = []
@@ -244,6 +318,25 @@ def get_recent_commits(
         )
     return commits
 
+
+@mcp.resource("standup://report-format")
+def report_format() -> str:
+    """The format every standup or weekly status report should follow."""
+    return (
+        "# Status report format\n"
+        "\n"
+        "## Done\n"
+        "- One line per finished item (commits merged, issues closed), most important first.\n"
+        "\n"
+        "## In progress\n"
+        "- Open pull requests and what they are waiting on.\n"
+        "\n"
+        "## Blockers / needs attention\n"
+        "- Stale pull requests and open issues that need a decision.\n"
+        "\n"
+        "Rules: be concise, use plain language, mention PR and issue numbers, "
+        "and never invent work that does not appear in the data.\n"
+    )
 
 if __name__ == "__main__":
     mcp.run()
