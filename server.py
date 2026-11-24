@@ -1,24 +1,25 @@
-import subprocess
-from pathlib import Path
-
-import os
-import re
-
-import httpx
-from dotenv import load_dotenv
-from datetime import datetime, timedelta, timezone
-
-from mcp.server.mcpserver import MCPServer
-from mcp.server.mcpserver.exceptions import ToolError
-
 import json
 import logging
+import os
+import re
 import sqlite3
+import subprocess
 import sys
 import time
 from contextlib import closing
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import httpx
+from dotenv import load_dotenv
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 mcp = MCPServer("standup-mcp")
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 
 # Unit separator: a character that never appears in commit messages
 SEP = "\x1f"
@@ -30,12 +31,33 @@ load_dotenv(Path(__file__).parent / ".env")
 GITHUB_API = "https://api.github.com"
 REPO_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
-
+# Logs go to stderr. Never print() to stdout: it would corrupt the MCP protocol.
 logging.basicConfig(stream=sys.stderr, level=logging.INFO)
 log = logging.getLogger("standup-mcp")
 
 DB_PATH = Path(__file__).parent / "cache.db"
 CACHE_TTL_SECONDS = 300  # 5 minutes
+
+REPORT_FORMAT = (
+    "# Status report format\n"
+    "\n"
+    "## Done\n"
+    "- One line per finished item (commits merged, issues closed), most important first.\n"
+    "\n"
+    "## In progress\n"
+    "- Open pull requests and what they are waiting on.\n"
+    "\n"
+    "## Blockers / needs attention\n"
+    "- Stale pull requests and open issues that need a decision.\n"
+    "\n"
+    "Rules: be concise, use plain language, mention PR and issue numbers, "
+    "and never invent work that does not appear in the data.\n"
+)
+
+
+# ---------------------------------------------------------------------------
+# SQLite cache
+# ---------------------------------------------------------------------------
 
 
 def _db() -> sqlite3.Connection:
@@ -73,6 +95,11 @@ def _cache_put(key: str, value) -> None:
         log.warning("cache write failed: %s", e)
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
 def _github_get(path: str, params: dict | None = None) -> list | dict:
     """Call the GitHub API (with a short-lived cache) and raise readable errors."""
     key = path + "?" + json.dumps(params or {}, sort_keys=True)
@@ -105,10 +132,23 @@ def _github_get(path: str, params: dict | None = None) -> list | dict:
         raise ToolError("GitHub refused the request (rate limit or missing permission).")
     if response.status_code >= 400:
         raise ToolError(f"GitHub API error: HTTP {response.status_code}")
+
     data = response.json()
     _cache_put(key, data)
     log.info("cache miss, fetched: %s", path)
     return data
+
+def _resolve_repo_path(repo_path: str) -> Path:
+    """Resolve a repo path and enforce the optional ALLOWED_REPO_ROOTS allowlist."""
+    path = Path(repo_path).expanduser().resolve()
+    allowed = [
+        Path(root).expanduser().resolve()
+        for root in os.environ.get("ALLOWED_REPO_ROOTS", "").split(os.pathsep)
+        if root.strip()
+    ]
+    if allowed and not any(path == root or path.is_relative_to(root) for root in allowed):
+        raise ToolError("That folder is not in the allowed repository roots.")
+    return path
 
 def _check_repo(repo: str) -> None:
     if not REPO_PATTERN.match(repo):
@@ -118,6 +158,93 @@ def _check_repo(repo: str) -> None:
 def _parse_time(value: str) -> datetime:
     # GitHub returns times like "2026-11-20T00:22:23Z"
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _read_commits(
+    repo_path: str, days: int, author: str | None, max_commits: int
+) -> list[dict]:
+    """Read commits from a local git repo. Shared by several tools."""
+    if not 1 <= days <= 90:
+        raise ToolError("days must be between 1 and 90")
+    if not 1 <= max_commits <= 200:
+        raise ToolError("max_commits must be between 1 and 200")
+
+    path = _resolve_repo_path(repo_path)
+    if not path.is_dir():
+        raise ToolError(f"Not a directory: {path}")
+    if not (path / ".git").exists():
+        raise ToolError(f"Not a git repository: {path}")
+
+    # Build the command as a list (never a string) to avoid shell injection
+    cmd = [
+        "git", "-C", str(path), "log",
+        f"--since={days}.days.ago",
+        f"--max-count={max_commits}",
+        f"--pretty=format:%h{SEP}%an{SEP}%aI{SEP}%s",
+    ]
+    if author:
+        cmd.append(f"--author={author}")
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            check=True,
+        )
+    except FileNotFoundError:
+        raise ToolError("git is not installed or not on PATH")
+    except subprocess.TimeoutExpired:
+        raise ToolError("git log timed out")
+    except subprocess.CalledProcessError as e:
+        raise ToolError(f"git log failed: {e.stderr.strip()}")
+
+    commits = []
+    for line in result.stdout.splitlines():
+        sha, name, date, message = line.split(SEP, 3)
+        commits.append({"sha": sha, "author": name, "date": date, "message": message})
+    return commits
+
+
+def _repo_from_remote(path: Path) -> str:
+    """Work out "owner/name" from the repo's origin remote URL."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            check=True,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError):
+        raise ToolError(
+            "Could not read the 'origin' remote. Pass repo as \"owner/name\" instead."
+        )
+    match = re.search(
+        r"github\.com[:/]([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$",
+        result.stdout.strip(),
+    )
+    if not match:
+        raise ToolError(
+            "The origin remote is not a GitHub URL. Pass repo as \"owner/name\" instead."
+        )
+    return f"{match.group(1)}/{match.group(2)}"
+
+
+def _section(title: str, lines: list[str]) -> str:
+    body = "\n".join(f"- {line}" for line in lines) or "- Nothing to report."
+    return f"## {title}\n{body}"
+
+
+# ---------------------------------------------------------------------------
+# Tools
+# ---------------------------------------------------------------------------
+
 
 @mcp.tool()
 def clear_cache() -> str:
@@ -129,6 +256,25 @@ def clear_cache() -> str:
         raise ToolError(f"Could not clear the cache: {e}")
     return "Cache cleared."
 
+
+@mcp.tool()
+def get_recent_commits(
+    repo_path: str,
+    days: int = 7,
+    author: str | None = None,
+    max_commits: int = 50,
+) -> list[dict]:
+    """Get recent commits from a local git repository.
+
+    Args:
+        repo_path: Absolute path to a local git repository folder, e.g. "C:\\Users\\tanis\\Downloads\\Code2". Not a GitHub URL.
+        days: How many days back to look (1-90).
+        author: Only include commits whose author name or email contains this text. Optional.
+        max_commits: Maximum number of commits to return (1-200).
+    """
+    return _read_commits(repo_path, days, author, max_commits)
+
+
 @mcp.tool()
 def list_pull_requests(
     repo: str,
@@ -139,9 +285,9 @@ def list_pull_requests(
     """List pull requests for a GitHub repository.
 
     Args:
-        repo: Repository in "owner/name" form, e.g. "tanisha-modi/stand-up-mcp".
+        repo: Full repository name as "owner/name", for example "tanisha-modi/stand-up-mcp".
         state: One of "open", "closed", or "all".
-        author: Only include PRs opened by this GitHub username.
+        author: Only include PRs opened by this GitHub username (no slash). Optional.
         max_results: Maximum number of PRs to return (1-50).
     """
     _check_repo(repo)
@@ -185,8 +331,8 @@ def list_open_issues(
     """List open issues (not pull requests) for a GitHub repository.
 
     Args:
-        repo: Repository in "owner/name" form, e.g. "tanisha-modi/stand-up-mcp".
-        assignee: Only include issues assigned to this GitHub username.
+        repo: Full repository name as "owner/name", for example "tanisha-modi/stand-up-mcp".
+        assignee: Only include issues assigned to this GitHub username (no slash). Optional.
         max_results: Maximum number of issues to return (1-50).
     """
     _check_repo(repo)
@@ -225,14 +371,15 @@ def find_stale_prs(repo: str, stale_days: int = 7) -> list[dict]:
     """Find open pull requests that have had no activity for a while.
 
     Args:
-        repo: Repository in "owner/name" form, e.g. "tanisha-modi/stand-up-mcp".
+        repo: Full repository name as "owner/name", for example "tanisha-modi/stand-up-mcp".
         stale_days: A PR is stale if untouched for at least this many days (0-365).
     """
     _check_repo(repo)
     if not 0 <= stale_days <= 365:
         raise ToolError("stale_days must be between 0 and 365")
 
-    cutoff = datetime.now(timezone.utc) - timedelta(days=stale_days)
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=stale_days)
     pulls = _github_get(
         f"/repos/{repo}/pulls",
         params={"state": "open", "per_page": 50, "sort": "updated", "direction": "asc"},
@@ -247,96 +394,156 @@ def find_stale_prs(repo: str, stale_days: int = 7) -> list[dict]:
                     "number": pr["number"],
                     "title": pr["title"],
                     "author": pr["user"]["login"],
-                    "days_idle": (datetime.now(timezone.utc) - updated).days,
+                    "days_idle": (now - updated).days,
                     "url": pr["html_url"],
                 }
             )
     return stale
 
- 
+
 @mcp.tool()
-def get_recent_commits(
+def generate_status_report(
     repo_path: str,
+    repo: str | None = None,
     days: int = 7,
-    author: str | None = None,
-    max_commits: int = 50,
-) -> list[dict]:
-    """Get recent commits from a local git repository.
+    stale_days: int = 7,
+) -> str:
+    """Generate a ready-to-read status report: commits, PRs, issues, and blockers.
 
     Args:
-        repo_path: Absolute path to a local git repository folder, e.g. "C:\\Users\\tanis\\Downloads\\Code2". Not a GitHub URL.
-        days: How many days back to look (1-90).
-        author: Only include commits whose author name or email contains this text. Optional.
-        max_commits: Maximum number of commits to return (1-200).
+        repo_path: Absolute path to a local git repository folder, e.g. "C:\\Users\\tanis\\Downloads\\Code2".
+        repo: GitHub repository as "owner/name". Optional: if omitted, it is read from the local repo's origin remote.
+        days: How many days back the report covers (1-90).
+        stale_days: Open PRs idle for at least this many days are flagged as stale (0-365).
     """
-    # 1. Validate inputs before touching the file system or running anything
-    if not 1 <= days <= 90:
-        raise ToolError("days must be between 1 and 90")
-    if not 1 <= max_commits <= 200:
-        raise ToolError("max_commits must be between 1 and 200")
+    if not 0 <= stale_days <= 365:
+        raise ToolError("stale_days must be between 0 and 365")
 
-    path = Path(repo_path).expanduser().resolve()
-    if not path.is_dir():
-        raise ToolError(f"Not a directory: {path}")
-    if not (path / ".git").exists():
-        raise ToolError(f"Not a git repository: {path}")
+    # Reading commits also validates repo_path and days
+    commits = _read_commits(repo_path, days, None, 50)
+    if repo is None:
+        repo = _repo_from_remote(_resolve_repo_path(repo_path))
+    _check_repo(repo)
 
-    # 2. Build the git command as a list (never a string) to avoid shell injection
-    cmd = [
-        "git", "-C", str(path), "log",
-        f"--since={days}.days.ago",
-        f"--max-count={max_commits}",
-        f"--pretty=format:%h{SEP}%an{SEP}%aI{SEP}%s",
-    ]
-    if author:
-        cmd.append(f"--author={author}")
+    now = datetime.now(timezone.utc)
+    # Round to midnight so the cache key stays the same all day
+    since = (now - timedelta(days=days)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    stale_cutoff = now - timedelta(days=stale_days)
 
-    # 3. Run it, with a timeout so a hung process can't freeze the server
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=15,
-            check=True,
+    base = {"per_page": 50, "sort": "updated", "direction": "desc"}
+    pulls = _github_get(f"/repos/{repo}/pulls", params={**base, "state": "all"})
+    open_items = _github_get(f"/repos/{repo}/issues", params={**base, "state": "open"})
+    closed_items = _github_get(
+        f"/repos/{repo}/issues",
+        params={
+            **base,
+            "state": "closed",
+            "since": since.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        },
+    )
+
+    done = [f"Commit {c['sha']} ({c['date'][:10]}): {c['message']}" for c in commits]
+    for pr in pulls:
+        if pr.get("merged_at") and _parse_time(pr["merged_at"]) >= since:
+            done.append(f"Merged PR #{pr['number']}: {pr['title']}")
+    for item in closed_items:
+        if "pull_request" in item:
+            continue
+        if item.get("closed_at") and _parse_time(item["closed_at"]) >= since:
+            done.append(f"Closed issue #{item['number']}: {item['title']}")
+
+    in_progress, attention = [], []
+    for pr in pulls:
+        if pr["state"] != "open":
+            continue
+        updated = _parse_time(pr["updated_at"])
+        idle = (now - updated).days
+        kind = "Draft PR" if pr["draft"] else "PR"
+        in_progress.append(
+            f"{kind} #{pr['number']}: {pr['title']} (updated {idle} day(s) ago)"
         )
-    except FileNotFoundError:
-        raise ToolError("git is not installed or not on PATH")
-    except subprocess.TimeoutExpired:
-        raise ToolError("git log timed out")
-    except subprocess.CalledProcessError as e:
-        raise ToolError(f"git log failed: {e.stderr.strip()}")
+        if updated <= stale_cutoff:
+            attention.append(f"Stale PR #{pr['number']}: {pr['title']} (idle {idle} days)")
+    for item in open_items:
+        if "pull_request" not in item:
+            attention.append(f"Open issue #{item['number']}: {item['title']}")
 
-    # 4. Parse each line into a dictionary
-    commits = []
-    for line in result.stdout.splitlines():
-        sha, name, date, message = line.split(SEP, 3)
-        commits.append(
-            {"sha": sha, "author": name, "date": date, "message": message}
-        )
-    return commits
+    return "\n\n".join(
+        [
+            f"# Status report: {repo}\nPeriod: {since:%Y-%m-%d} to {now:%Y-%m-%d} (UTC)",
+            _section("Done", done),
+            _section("In progress", in_progress),
+            _section("Blockers / needs attention", attention),
+        ]
+    )
+
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
 
 
 @mcp.resource("standup://report-format")
 def report_format() -> str:
     """The format every standup or weekly status report should follow."""
-    return (
-        "# Status report format\n"
-        "\n"
-        "## Done\n"
-        "- One line per finished item (commits merged, issues closed), most important first.\n"
-        "\n"
-        "## In progress\n"
-        "- Open pull requests and what they are waiting on.\n"
-        "\n"
-        "## Blockers / needs attention\n"
-        "- Stale pull requests and open issues that need a decision.\n"
-        "\n"
-        "Rules: be concise, use plain language, mention PR and issue numbers, "
-        "and never invent work that does not appear in the data.\n"
+    return REPORT_FORMAT
+
+
+@mcp.resource("github://repo/{owner}/{name}/summary")
+def repo_summary(owner: str, name: str) -> str:
+    """A quick summary of a GitHub repository's open work: PR, issue, and stale PR counts."""
+    repo = f"{owner}/{name}"
+    _check_repo(repo)
+
+    pulls = _github_get(
+        f"/repos/{repo}/pulls",
+        params={"state": "open", "per_page": 50, "sort": "updated", "direction": "desc"},
     )
+    items = _github_get(
+        f"/repos/{repo}/issues",
+        params={"state": "open", "per_page": 50, "sort": "updated", "direction": "desc"},
+    )
+    issues = [i for i in items if "pull_request" not in i]
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+    stale = [p for p in pulls if _parse_time(p["updated_at"]) <= cutoff]
+
+    return (
+        f"Repository: {repo}\n"
+        f"Open pull requests: {len(pulls)}\n"
+        f"Open issues: {len(issues)}\n"
+        f"Pull requests idle for 7+ days: {len(stale)}\n"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Prompts
+# ---------------------------------------------------------------------------
+
+
+@mcp.prompt()
+def weekly_report(repo: str, repo_path: str, days: int = 7) -> str:
+    """Write a weekly status report from local commits plus GitHub PRs and issues.
+
+    Args:
+        repo: GitHub repository as "owner/name", e.g. "tanisha-modi/stand-up-mcp".
+        repo_path: Local folder of the same repository.
+        days: How many days back the report should cover.
+    """
+    return (
+        f"Write a status report for the last {days} days.\n\n"
+        f"1. Call get_recent_commits with repo_path={repo_path!r} and days={days}.\n"
+        f"2. Call list_pull_requests with repo={repo!r}, state='all'.\n"
+        f"3. Call list_open_issues with repo={repo!r}.\n"
+        f"4. Call find_stale_prs with repo={repo!r}.\n\n"
+        "Only report what the tool results show. If a tool returns nothing, say so "
+        "instead of inventing activity.\n\n"
+        "Use exactly this format:\n\n"
+        f"{REPORT_FORMAT}"
+    )
+
 
 if __name__ == "__main__":
     mcp.run()
