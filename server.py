@@ -161,7 +161,11 @@ def _parse_time(value: str) -> datetime:
 
 
 def _read_commits(
-    repo_path: str, days: int, author: str | None, max_commits: int
+    repo_path: str,
+    days: int,
+    author: str | None,
+    max_commits: int,
+    since: datetime | None = None,
 ) -> list[dict]:
     """Read commits from a local git repo. Shared by several tools."""
     if not 1 <= days <= 90:
@@ -175,10 +179,15 @@ def _read_commits(
     if not (path / ".git").exists():
         raise ToolError(f"Not a git repository: {path}")
 
+    if since is not None:
+        since_arg = since.strftime("%Y-%m-%dT%H:%M:%S+00:00") if since else f"{days}.days.ago"
+    else:
+        since_arg = f"{days}.days.ago"
+
     # Build the command as a list (never a string) to avoid shell injection
     cmd = [
         "git", "-C", str(path), "log",
-        f"--since={days}.days.ago",
+        f"--since={since_arg}",
         f"--max-count={max_commits}",
         f"--pretty=format:%h{SEP}%an{SEP}%aI{SEP}%s",
     ]
@@ -416,21 +425,22 @@ def generate_status_report(
         days: How many days back the report covers (1-90).
         stale_days: Open PRs idle for at least this many days are flagged as stale (0-365).
     """
+    if not 1 <= days <= 90:
+        raise ToolError("days must be between 1 and 90")
     if not 0 <= stale_days <= 365:
         raise ToolError("stale_days must be between 0 and 365")
 
-    # Reading commits also validates repo_path and days
-    commits = _read_commits(repo_path, days, None, 50)
-    if repo is None:
-        repo = _repo_from_remote(_resolve_repo_path(repo_path))
-    _check_repo(repo)
-
     now = datetime.now(timezone.utc)
-    # Round to midnight so the cache key stays the same all day
+    # Round to midnight so the period is a clean date range and the cache key is stable
     since = (now - timedelta(days=days)).replace(
         hour=0, minute=0, second=0, microsecond=0
     )
     stale_cutoff = now - timedelta(days=stale_days)
+
+    commits = _read_commits(repo_path, days, None, 50, since=since)
+    if repo is None:
+        repo = _repo_from_remote(_resolve_repo_path(repo_path))
+    _check_repo(repo)
 
     base = {"per_page": 50, "sort": "updated", "direction": "desc"}
     pulls = _github_get(f"/repos/{repo}/pulls", params={**base, "state": "all"})
